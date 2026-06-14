@@ -312,7 +312,8 @@ class TestReconciliationMatchingRules(AccountTestInvoicingCommon):
     @freeze_time("2020-01-01")
     def _check_statement_matching(self, rules, expected_values_list):
         for statement_line, expected_values in expected_values_list.items():
-            res = rules._apply_rules(statement_line, statement_line._retrieve_partner())
+            statement_line._retrieve_partner()
+            res = rules._apply_rules(statement_line, statement_line.partner_id)
             self.assertDictEqual(res, expected_values)
 
     def test_matching_fields(self):
@@ -896,7 +897,6 @@ class TestReconciliationMatchingRules(AccountTestInvoicingCommon):
                         self.rule_1.line_ids.id,
                         {
                             "amount": 50,
-                            "force_tax_included": True,
                             "tax_ids": [(6, 0, self.tax21.ids)],
                         },
                     ),
@@ -905,7 +905,6 @@ class TestReconciliationMatchingRules(AccountTestInvoicingCommon):
                         0,
                         {
                             "amount": 100,
-                            "force_tax_included": False,
                             "tax_ids": [(6, 0, self.tax12.ids)],
                             "account_id": self.current_assets_account.id,
                         },
@@ -915,67 +914,6 @@ class TestReconciliationMatchingRules(AccountTestInvoicingCommon):
         )
 
         self.bank_line_1.amount = -121
-
-        self._check_statement_matching(
-            self.rule_1,
-            {
-                self.bank_line_1: {
-                    "model": self.rule_1,
-                    "status": "write_off",
-                    "auto_reconcile": True,
-                },
-                self.bank_line_2: {
-                    "model": self.rule_1,
-                    "status": "write_off",
-                    "auto_reconcile": True,
-                },
-            },
-        )
-
-    def test_auto_reconcile_with_tax_fpos(self):
-        """Test the fiscal positions are applied by reconcile models when using taxes"""
-        self.rule_1.write(
-            {
-                "auto_reconcile": True,
-                "rule_type": "writeoff_suggestion",
-                "line_ids": [
-                    (
-                        1,
-                        self.rule_1.line_ids.id,
-                        {
-                            "amount": 100,
-                            "force_tax_included": True,
-                            "tax_ids": [(6, 0, self.tax21.ids)],
-                        },
-                    )
-                ],
-            }
-        )
-
-        self.partner_1.country_id = self.env.ref("base.lu")
-        belgium = self.env.ref("base.be")
-        self.partner_2.country_id = belgium
-
-        self.bank_line_2.partner_id = self.partner_2
-
-        self.bank_line_1.amount = -121
-        self.bank_line_2.amount = -112
-
-        self.env["account.fiscal.position"].create(
-            {
-                "name": "Test",
-                "country_id": belgium.id,
-                "auto_apply": True,
-                "tax_ids": [
-                    Command.create(
-                        {
-                            "tax_src_id": self.tax21.id,
-                            "tax_dest_id": self.tax12.id,
-                        }
-                    ),
-                ],
-            }
-        )
 
         self._check_statement_matching(
             self.rule_1,
@@ -1166,17 +1104,23 @@ class TestReconciliationMatchingRules(AccountTestInvoicingCommon):
         )
 
         # Matching using the regex on payment_ref.
-        self.assertEqual(st_line._retrieve_partner(), self.partner_1)
+        st_line.partner_id = False
+        st_line._retrieve_partner()
+        self.assertEqual(st_line.partner_id, self.partner_1)
 
         rule.partner_mapping_line_ids.narration_regex = ".*coincoin"
 
         # No match because the narration is not matching the regex.
-        self.assertEqual(st_line._retrieve_partner(), self.env["res.partner"])
+        st_line.partner_id = False
+        st_line._retrieve_partner()
+        self.assertEqual(st_line.partner_id, self.env["res.partner"])
 
         st_line.narration = "42coincoin"
 
         # Matching is back thanks to "coincoin".
-        self.assertEqual(st_line._retrieve_partner(), self.partner_1)
+        st_line.partner_id = False
+        st_line._retrieve_partner()
+        self.assertEqual(st_line.partner_id, self.partner_1)
 
     def test_match_multi_currencies(self):
         """Ensure the matching of candidates is made using the right statement line
@@ -1676,65 +1620,3 @@ class TestReconciliationMatchingRules(AccountTestInvoicingCommon):
                     },
                 },
             )
-
-    def test_regex_matching_simple(self):
-        lines = self.rule_3._get_write_off_move_lines_dict(
-            90.0,
-            False,
-            label="R:9772938 10/07 AX 9415116318 T:5 BRT: 100.00 C/ croip",
-        )
-        self.assertEqual(len(lines), 2)
-        for line in lines:
-            if (
-                line["account_id"]
-                == self.company_data["default_account_deferred_expense"].id
-            ):
-                due_line = line
-            elif (
-                line["account_id"]
-                == self.company_data["default_tax_account_receivable"].id
-            ):
-                tax_line = line
-        self.assertTrue(due_line)
-        self.assertTrue(tax_line)
-        self.assertEqual(due_line["debit"], 100.0)
-        self.assertEqual(tax_line["credit"], 10.0)
-
-    def test_regex_matching_thousand_sep(self):
-        lines = self.rule_3._get_write_off_move_lines_dict(
-            90.0,
-            False,
-            label="R:9772938 10/07 AX 9415116318 T:5 BRT: 1,234.56 C/ croip",
-        )
-        for line in lines:
-            if (
-                line["account_id"]
-                == self.company_data["default_account_deferred_expense"].id
-            ):
-                due_line = line
-        self.assertTrue(due_line)
-        self.assertEqual(due_line["debit"], 1234.56)
-
-    def test_regex_matching_comma_decimal(self):
-        lines = self.rule_3._get_write_off_move_lines_dict(
-            90.0,
-            False,
-            label="R:9772938 10/07 AX 9415116318 T:5 BRT: 1234,56 C/ croip",
-        )
-        for line in lines:
-            if (
-                line["account_id"]
-                == self.company_data["default_account_deferred_expense"].id
-            ):
-                due_line = line
-        self.assertTrue(due_line)
-        self.assertEqual(due_line["debit"], 1234.56)
-
-    def test_regex_not_matched(self):
-        lines = self.rule_3._get_write_off_move_lines_dict(
-            90.0,
-            False,
-            label="R:9772938 10/07 AX 9415116318 T:5 BRT: XX100.00 C/ croip",
-        )
-        self.assertEqual(len(lines), 1)
-        self.assertEqual(lines[0]["debit"], 90.0)

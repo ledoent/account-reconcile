@@ -5,12 +5,85 @@
         <field name="model">account.reconcile.model</field>
         <field name="inherit_id" ref="account.view_account_reconcile_model_form" />
         <field name="arch" type="xml">
-            <field name="matching_order" position="after">
+            <xpath expr="//group[@id='filters_left_column']" position="inside">
+                <field name="rule_type" />
+                <field name="auto_reconcile" />
+                <field
+                    name="match_nature"
+                    invisible="rule_type != 'invoice_matching'"
+                />
+                <field
+                    name="match_same_currency"
+                    invisible="rule_type != 'invoice_matching'"
+                />
+                <field
+                    name="match_partner"
+                    invisible="rule_type != 'invoice_matching'"
+                />
+                <field
+                    name="match_partner_category_ids"
+                    widget="many2many_tags"
+                    invisible="rule_type != 'invoice_matching'"
+                />
+                <field
+                    name="past_months_limit"
+                    invisible="rule_type != 'invoice_matching'"
+                />
+                <field
+                    name="matching_order"
+                    invisible="rule_type != 'invoice_matching'"
+                />
                 <field
                     name="unique_matching"
-                    invisible="rule_type!='invoice_matching'"
+                    invisible="rule_type != 'invoice_matching'"
                 />
-            </field>
+            </xpath>
+            <xpath expr="//page[@id='counterpart_items_tab']" position="after">
+                <page
+                    id="invoice_matching_tab"
+                    string="Invoice Matching"
+                    invisible="rule_type != 'invoice_matching'"
+                >
+                    <group>
+                        <group string="Text Matching">
+                            <field name="match_text_location_label" />
+                            <field name="match_text_location_note" />
+                            <field name="match_text_location_reference" />
+                            <field name="match_note" />
+                            <field name="match_note_param" invisible="not match_note" />
+                            <field name="match_transaction_type" />
+                            <field
+                                name="match_transaction_type_param"
+                                invisible="not match_transaction_type"
+                            />
+                        </group>
+                        <group string="Payment Tolerance">
+                            <field name="allow_payment_tolerance" />
+                            <field
+                                name="payment_tolerance_type"
+                                invisible="not allow_payment_tolerance"
+                            />
+                            <field
+                                name="payment_tolerance_param"
+                                invisible="not allow_payment_tolerance"
+                            />
+                        </group>
+                    </group>
+                </page>
+                <page
+                    id="partner_mapping_tab"
+                    string="Partner Mapping"
+                    invisible="rule_type not in ('invoice_matching', 'writeoff_suggestion')"
+                >
+                    <field name="partner_mapping_line_ids">
+                        <list editable="bottom">
+                            <field name="partner_id" />
+                            <field name="payment_ref_regex" />
+                            <field name="narration_regex" />
+                        </list>
+                    </field>
+                </page>
+            </xpath>
         </field>
     </record>
 </odoo>

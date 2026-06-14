@@ -3,16 +3,163 @@ from collections import defaultdict
 
 from dateutil.relativedelta import relativedelta
 
-from odoo import Command, api, fields, models, tools
+from odoo import api, fields, models, tools
+from odoo.exceptions import ValidationError
+from odoo.tools import SQL
 
 
 class AccountReconcileModel(models.Model):
     _inherit = "account.reconcile.model"
 
+    rule_type = fields.Selection(
+        selection=[
+            ("writeoff_button", "Button to generate counterpart entry"),
+            ("writeoff_suggestion", "Rule to suggest counterpart entry"),
+            ("invoice_matching", "Rule to match invoices/bills"),
+        ],
+        string="Type",
+        default="writeoff_button",
+        required=True,
+        tracking=True,
+    )
+    auto_reconcile = fields.Boolean(
+        string="Auto-validate",
+        tracking=True,
+        help="Validate the statement line automatically (reconciliation based on "
+        "your rule).",
+    )
+    match_nature = fields.Selection(
+        selection=[
+            ("amount_received", "Received"),
+            ("amount_paid", "Paid"),
+            ("both", "Paid/Received"),
+        ],
+        string="Amount Nature",
+        required=True,
+        default="both",
+        tracking=True,
+        help="The reconciliation model will only be applied to the selected "
+        "transaction type:\n"
+        "* Received: Only applied when receiving an amount.\n"
+        "* Paid: Only applied when paying an amount.\n"
+        "* Paid/Received: Applied in both cases.",
+    )
+    match_note = fields.Selection(
+        selection=[
+            ("contains", "Contains"),
+            ("not_contains", "Not Contains"),
+            ("match_regex", "Match Regex"),
+        ],
+        string="Note",
+        tracking=True,
+        help="The reconciliation model will only be applied when the note "
+        "matches the configured value.",
+    )
+    match_note_param = fields.Char(string="Note Parameter", tracking=True)
+    match_transaction_type = fields.Selection(
+        selection=[
+            ("contains", "Contains"),
+            ("not_contains", "Not Contains"),
+            ("match_regex", "Match Regex"),
+        ],
+        string="Transaction Type",
+        tracking=True,
+        help="The reconciliation model will only be applied when the "
+        "transaction type matches the configured value.",
+    )
+    match_transaction_type_param = fields.Char(
+        string="Transaction Type Parameter", tracking=True
+    )
+    match_same_currency = fields.Boolean(
+        string="Same Currency",
+        default=True,
+        tracking=True,
+        help="Restrict to propositions having the same currency as the statement line.",
+    )
+    match_partner = fields.Boolean(
+        string="Partner Is Set",
+        tracking=True,
+        help="The reconciliation model will only be applied when a "
+        "customer/vendor is set.",
+    )
+    match_partner_category_ids = fields.Many2many(
+        comodel_name="res.partner.category",
+        string="Matching Categories",
+        help="The reconciliation model will only be applied to the selected "
+        "customer/vendor categories.",
+    )
+    match_text_location_label = fields.Boolean(
+        string="Search in Label",
+        default=True,
+        tracking=True,
+        help="Search in the statement line label to find the invoice/payment "
+        "reference.",
+    )
+    match_text_location_note = fields.Boolean(
+        string="Search in Notes",
+        default=False,
+        tracking=True,
+        help="Search in the statement line notes to find the invoice/payment "
+        "reference.",
+    )
+    match_text_location_reference = fields.Boolean(
+        string="Search in Reference",
+        default=False,
+        tracking=True,
+        help="Search in the statement line reference to find the "
+        "invoice/payment reference.",
+    )
+    past_months_limit = fields.Integer(
+        string="Search Months Limit",
+        default=18,
+        tracking=True,
+        help="Number of months in the past to consider entries from when "
+        "applying this model. Leave empty for no limit.",
+    )
+    allow_payment_tolerance = fields.Boolean(
+        string="Payment Tolerance",
+        default=True,
+        tracking=True,
+        help="Difference accepted in case of underpayment.",
+    )
+    payment_tolerance_param = fields.Float(
+        string="Gap",
+        default=0.0,
+        tracking=True,
+        help="The sum of the residual amount propositions matches the "
+        "statement line amount under this amount/percentage.",
+    )
+    payment_tolerance_type = fields.Selection(
+        selection=[("percentage", "in percentage"), ("fixed_amount", "in amount")],
+        default="percentage",
+        required=True,
+        tracking=True,
+        help="The gap type used by the payment tolerance.",
+    )
+    partner_mapping_line_ids = fields.One2many(
+        comodel_name="account.reconcile.model.partner.mapping",
+        inverse_name="model_id",
+        string="Partner Mapping Lines",
+        help="The mapping uses regular expressions.\n"
+        "- To match the text at the beginning of the line (in label or notes), "
+        "simply fill in your text.\n"
+        "- To match the text anywhere (in label or notes), put your text "
+        "between .*\n"
+        "  e.g: .*N°48748 abc123.*",
+    )
     unique_matching = fields.Boolean(
         string="Unique match",
         help="If this box is checked, counterparts will only be suggested if only "
         "one possible counterpart is found.",
+    )
+    matching_order = fields.Selection(
+        selection=[
+            ("old_first", "Oldest first"),
+            ("new_first", "Newest first"),
+        ],
+        required=True,
+        default="old_first",
+        tracking=True,
     )
 
     @api.onchange("rule_type")
@@ -22,180 +169,6 @@ class AccountReconcileModel(models.Model):
 
     ####################################################
     # RECONCILIATION PROCESS
-    ####################################################
-
-    def _apply_lines_for_bank_widget(self, residual_amount_currency, partner, st_line):
-        """Apply the reconciliation model lines to the statement line passed as
-        parameter.
-        :param residual_amount_currency: The open balance of the statement line in the
-          bank reconciliation widget expressed in the statement line currency.
-        :param partner: The partner set on the wizard.
-        :param st_line: The statement line processed by the bank reconciliation widget.
-        :return: A list of python dictionaries (one per reconcile model line)
-          representing the journal items to be created by the current reconcile model.
-        """
-        self.ensure_one()
-        currency = (
-            st_line.foreign_currency_id
-            or st_line.journal_id.currency_id
-            or st_line.company_currency_id
-        )
-        if currency.is_zero(residual_amount_currency):
-            return []
-
-        vals_list = []
-        for line in self.line_ids:
-            vals = line._apply_in_bank_widget(
-                residual_amount_currency, partner, st_line
-            )
-            amount_currency = vals["amount_currency"]
-
-            if currency.is_zero(amount_currency):
-                continue
-
-            vals_list.append(vals)
-            residual_amount_currency -= amount_currency
-
-        return vals_list
-
-    def _get_taxes_move_lines_dict(self, tax, base_line_dict):
-        """Get move.lines dict (to be passed to the create()) corresponding to a tax.
-        :param tax: An account.tax record.
-        :param base_line_dict: A dict representing the move.line containing the base
-          amount.
-        :return: A list of dict representing move.lines to be created corresponding to
-          the tax.
-        """
-        self.ensure_one()
-        balance = base_line_dict["balance"]
-
-        tax_type = tax.type_tax_use
-        is_refund = (tax_type == "sale" and balance < 0) or (
-            tax_type == "purchase" and balance > 0
-        )
-
-        res = tax.compute_all(balance, is_refund=is_refund)
-
-        new_aml_dicts = []
-        for tax_res in res["taxes"]:
-            tax = self.env["account.tax"].browse(tax_res["id"])
-            balance = tax_res["amount"]
-            name = " ".join(
-                [x for x in [base_line_dict.get("name", ""), tax_res["name"]] if x]
-            )
-            new_aml_dicts.append(
-                {
-                    "account_id": tax_res["account_id"] or base_line_dict["account_id"],
-                    "journal_id": base_line_dict.get("journal_id", False),
-                    "name": name,
-                    "partner_id": base_line_dict.get("partner_id"),
-                    "balance": balance,
-                    "debit": balance > 0 and balance or 0,
-                    "credit": balance < 0 and -balance or 0,
-                    "analytic_distribution": tax.analytic
-                    and base_line_dict["analytic_distribution"],
-                    "tax_repartition_line_id": tax_res["tax_repartition_line_id"],
-                    "tax_ids": [(6, 0, tax_res["tax_ids"])],
-                    "tax_tag_ids": [(6, 0, tax_res["tag_ids"])],
-                    "group_tax_id": tax_res["group"].id if tax_res["group"] else False,
-                    "currency_id": False,
-                    "reconcile_model_id": self.id,
-                }
-            )
-
-            # Handle price included taxes.
-            base_balance = tax_res["base"]
-            base_line_dict.update(
-                {
-                    "balance": base_balance,
-                    "debit": base_balance > 0 and base_balance or 0,
-                    "credit": base_balance < 0 and -base_balance or 0,
-                }
-            )
-
-        base_line_dict["tax_tag_ids"] = [(6, 0, res["base_tags"])]
-        return new_aml_dicts
-
-    @api.model
-    def _str2float(self, amount_string):
-        """Convert a string to float"""
-        # Remove thousands separator
-        seps = [" ", ",", "."]
-        for sep in seps:
-            amount_string = amount_string[:-3].replace(sep, "") + amount_string[-3:]
-        # Use dot as decimal separator
-        amount_string = amount_string.replace(",", ".")
-        return float(amount_string)
-
-    def _get_write_off_move_lines_dict(self, residual_balance, partner_id, label=None):
-        """Get move.lines dict corresponding to the reconciliation model's write-off
-        lines.
-        :param residual_balance: The residual balance of the account on the manual
-          reconciliation widget.
-        :return: A list of dict representing move.lines to be created corresponding to
-          the write-off lines.
-        """
-        self.ensure_one()
-
-        if self.rule_type == "invoice_matching" and (
-            not self.allow_payment_tolerance or self.payment_tolerance_param == 0
-        ):
-            return []
-
-        currency = self.company_id.currency_id
-
-        lines_vals_list = []
-        for line in self.line_ids:
-            balance = 0
-            if line.amount_type == "percentage":
-                balance = currency.round(residual_balance * (line.amount / 100.0))
-            elif line.amount_type == "fixed":
-                balance = currency.round(
-                    line.amount * (1 if residual_balance > 0.0 else -1)
-                )
-            elif line.amount_type == "regex":
-                m = re.findall(line.amount_string, label or "")
-                if m:
-                    extracted_amount = self._str2float(m[0])
-                    balance = currency.round(
-                        extracted_amount * (1 if residual_balance > 0.0 else -1)
-                    )
-                else:
-                    balance = 0.0
-            else:
-                balance = 0.0
-
-            if currency.is_zero(balance):
-                continue
-
-            writeoff_line = line._get_write_off_move_line_dict(balance, currency)
-            lines_vals_list.append(writeoff_line)
-
-            residual_balance -= balance
-
-            if line.tax_ids:
-                taxes = line.tax_ids
-                detected_fiscal_position = self.env[
-                    "account.fiscal.position"
-                ]._get_fiscal_position(self.env["res.partner"].browse(partner_id))
-                if detected_fiscal_position:
-                    taxes = detected_fiscal_position.map_tax(taxes)
-                writeoff_line["tax_ids"] += [Command.set(taxes.ids)]
-                # Multiple taxes with force_tax_included results in wrong computation,
-                # so we only allow to set the force_tax_included field if we have one
-                # tax selected
-                if line.force_tax_included:
-                    taxes = taxes[0].with_context(force_price_include=True)
-                tax_vals_list = self._get_taxes_move_lines_dict(taxes, writeoff_line)
-                lines_vals_list += tax_vals_list
-                if not line.force_tax_included:
-                    for tax_line in tax_vals_list:
-                        residual_balance -= tax_line["balance"]
-
-        return lines_vals_list
-
-    ####################################################
-    # RECONCILIATION CRITERIA
     ####################################################
 
     def _apply_rules(self, st_line, partner):
@@ -422,37 +395,40 @@ class AccountReconcileModel(models.Model):
         self.env["account.move.line"].flush_model()
 
         aml_domain = self._get_invoice_matching_amls_domain(st_line, partner)
-        query = self.env["account.move.line"]._where_calc(aml_domain)
-        from_string, from_params = query.from_clause
-        where_string, where_params = query.where_clause
-        from_clause = from_string
-        where_clause = where_string
+        query = self.env["account.move.line"]._search(aml_domain)
+        from_clause = query.from_clause
+        where_clause = query.where_clause or SQL("TRUE")
 
         sub_queries = []
-        all_params = []
-        aml_cte = ""
+        aml_cte = SQL("")
         (
             numerical_tokens,
             exact_tokens,
             _text_tokens,
         ) = self._get_invoice_matching_st_line_tokens(st_line)
         if numerical_tokens or exact_tokens:
-            aml_cte = rf"""
+            aml_cte = SQL(
+                """
                 WITH aml_cte AS (
                     SELECT
                         account_move_line.id as account_move_line_id,
                         account_move_line.date as account_move_line_date,
-                        account_move_line.date_maturity as account_move_line_date_maturity,
+                        account_move_line.date_maturity
+                            as account_move_line_date_maturity,
                         account_move_line.name as account_move_line_name,
-                        account_move_line__move_id.name as account_move_line__move_id_name,
-                        account_move_line__move_id.ref as account_move_line__move_id_ref
-                    FROM {from_clause}
+                        account_move_line__move_id.name
+                            as account_move_line__move_id_name,
+                        account_move_line__move_id.ref
+                            as account_move_line__move_id_ref
+                    FROM %s
                     JOIN account_move account_move_line__move_id
                         ON account_move_line__move_id.id = account_move_line.move_id
-                    WHERE {where_clause}
+                    WHERE %s
                 )
-            """  # noqa: E501
-            all_params += where_params
+                """,
+                from_clause,
+                where_clause,
+            )
 
         enabled_matches = []
         if self.match_text_location_label:
@@ -465,7 +441,8 @@ class AccountReconcileModel(models.Model):
         if numerical_tokens:
             for table_alias, field in enabled_matches:
                 sub_queries.append(
-                    rf"""
+                    SQL(
+                        rf"""
                     SELECT
                         account_move_line_id as id,
                         account_move_line_date as date,
@@ -484,12 +461,14 @@ class AccountReconcileModel(models.Model):
                     FROM aml_cte
                     WHERE {table_alias}_{field} IS NOT NULL
                 """
+                    )
                 )
 
         if exact_tokens:
             for table_alias, field in enabled_matches:
                 sub_queries.append(
-                    rf"""
+                    SQL(
+                        rf"""
                     SELECT
                         account_move_line_id as id,
                         account_move_line_date as date,
@@ -498,29 +477,31 @@ class AccountReconcileModel(models.Model):
                     FROM aml_cte
                     WHERE COALESCE({table_alias}_{field}, '') != ''
                 """
+                    )
                 )
 
         if sub_queries:
             order_by = get_order_by_clause(alias="sub")
-            self._cr.execute(
-                aml_cte
-                + """
+            self.env.cr.execute(
+                SQL(
+                    """
+                    %s
                     SELECT
                         sub.id,
                         COUNT(*) AS nb_match
-                    FROM ("""
-                + " UNION ALL ".join(sub_queries)
-                + """) AS sub
+                    FROM (%s) AS sub
                     WHERE sub.token IN %s
                     GROUP BY sub.date_maturity, sub.date, sub.id
                     HAVING COUNT(*) > 0
-                    ORDER BY nb_match DESC, """
-                + order_by
-                + """
-                """,
-                all_params + [tuple(numerical_tokens + exact_tokens)],
+                    ORDER BY nb_match DESC, %s
+                    """,
+                    aml_cte,
+                    SQL(" UNION ALL ").join(sub_queries),
+                    tuple(numerical_tokens + exact_tokens),
+                    SQL(order_by),
+                )
             )
-            candidate_ids = [r[0] for r in self._cr.fetchall()]
+            candidate_ids = [r[0] for r in self.env.cr.fetchall()]
             if candidate_ids and (
                 not self.unique_matching
                 or (self.unique_matching and len(candidate_ids) == 1)
@@ -551,26 +532,29 @@ class AccountReconcileModel(models.Model):
                 aml_amount_field = "amount_residual_currency"
 
             order_by = get_order_by_clause(alias="account_move_line")
-            self._cr.execute(
-                f"""
+            self.env.cr.execute(
+                SQL(
+                    """
                     SELECT account_move_line.id
-                    FROM {from_clause}
+                    FROM %s
                     WHERE
-                        {where_clause}
+                        %s
                         AND account_move_line.currency_id = %s
-                        AND ROUND(account_move_line.{aml_amount_field}, %s) = ROUND(%s, %s)
-                    ORDER BY {order_by}
-                """,  # noqa: E501
-                where_params
-                + [
+                        AND ROUND(account_move_line.%s, %s) = ROUND(%s, %s)
+                    ORDER BY %s
+                    """,
+                    from_clause,
+                    where_clause,
                     st_line_currency.id,
+                    SQL.identifier(aml_amount_field),
                     st_line_currency.decimal_places,
                     -st_line.amount_residual,
                     st_line_currency.decimal_places,
-                ],
+                    SQL(order_by),
+                )
             )
             amls = self.env["account.move.line"].browse(
-                [row[0] for row in self._cr.fetchall()]
+                [row[0] for row in self.env.cr.fetchall()]
             )
         else:
             amls = self.env["account.move.line"].search(
@@ -837,20 +821,51 @@ class AccountReconcileModel(models.Model):
         return {"rejected"}
 
 
-class AccountReconcileModelLine(models.Model):
-    _inherit = "account.reconcile.model.line"
+class AccountReconcileModelPartnerMapping(models.Model):
+    _name = "account.reconcile.model.partner.mapping"
+    _description = "Partner mapping for reconciliation models"
+    _check_company_auto = True
 
-    def _get_write_off_move_line_dict(self, balance, currency):
-        self.ensure_one()
-        return {
-            "name": self.label,
-            "balance": balance,
-            "debit": balance > 0 and balance or 0,
-            "credit": balance < 0 and -balance or 0,
-            "account_id": self.account_id.id,
-            "currency_id": currency.id,
-            "analytic_distribution": self.analytic_distribution,
-            "reconcile_model_id": self.model_id.id,
-            "journal_id": self.journal_id.id,
-            "tax_ids": [],
-        }
+    model_id = fields.Many2one(
+        comodel_name="account.reconcile.model",
+        readonly=True,
+        required=True,
+        ondelete="cascade",
+    )
+    company_id = fields.Many2one(related="model_id.company_id")
+    partner_id = fields.Many2one(
+        comodel_name="res.partner",
+        string="Partner",
+        required=True,
+        ondelete="cascade",
+        check_company=True,
+    )
+    payment_ref_regex = fields.Char(string="Find Text in Label")
+    narration_regex = fields.Char(string="Find Text in Notes")
+
+    @api.constrains("narration_regex", "payment_ref_regex")
+    def validate_regex(self):
+        for record in self:
+            if not (record.narration_regex or record.payment_ref_regex):
+                raise ValidationError(
+                    self.env._(
+                        "Please set at least one of the match texts to create a "
+                        "partner mapping."
+                    )
+                )
+            current_regex = None
+            try:
+                if record.payment_ref_regex:
+                    current_regex = record.payment_ref_regex
+                    re.compile(record.payment_ref_regex)
+                if record.narration_regex:
+                    current_regex = record.narration_regex
+                    re.compile(record.narration_regex)
+            except re.error as e:
+                raise ValidationError(
+                    self.env._(
+                        "The following regular expression is invalid to create a "
+                        "partner mapping: %s",
+                        current_regex,
+                    )
+                ) from e
