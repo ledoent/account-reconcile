@@ -590,6 +590,62 @@ class TestReconciliationWidget(TestAccountReconciliationCommon):
         )
         self.assertTrue(bank_stmt_line.is_reconciled)
 
+    @mute_logger("odoo.models.unlink")
+    def test_auto_reconcile_invoices_skips_own_liquidity_account(self):
+        """The invoice auto-matcher must skip the journal's own liquidity account.
+
+        Bank accounts are reconcile=False, so they never reach the candidate
+        query. liability_credit_card accounts default to reconcile=True, so a
+        card journal matches its own unreconciled lines against each other.
+        _reconcile_bank_line_edit() writes the counterpart onto the statement
+        move, leaving it with two bank/cash lines, and _synchronize_from_moves
+        raises "reached an invalid state regarding its related statement line".
+        """
+        journal = self.bank_journal_euro
+        journal.default_account_id.reconcile = True
+        bank_stmt = self.acc_bank_stmt_model.create(
+            {
+                "journal_id": journal.id,
+                "date": time.strftime("%Y-07-15"),
+                "name": "liquidity counterpart",
+            }
+        )
+        existing = self.acc_bank_stmt_line_model.create(
+            {
+                "payment_ref": "CARD CHARGE",
+                "journal_id": journal.id,
+                "statement_id": bank_stmt.id,
+                "amount": 100,
+                "date": time.strftime("%Y-07-15"),
+            }
+        )
+        # Only the liquidity line shares the sign of the incoming line, so it is
+        # the single candidate the query's `HAVING COUNT(*) = 1` will accept.
+        liquidity_lines, _suspense, _other = existing._seek_for_lines()
+        self.assertEqual(liquidity_lines.account_id, journal.default_account_id)
+        self.assertFalse(liquidity_lines.reconciled)
+
+        # payment_ref matches the first move's name, so the auto-matcher finds
+        # that liquidity line. Before the fix this create() raised UserError.
+        new_line = self.acc_bank_stmt_line_model.create(
+            {
+                "payment_ref": existing.move_id.name,
+                "journal_id": journal.id,
+                "statement_id": bank_stmt.id,
+                "amount": 100,
+                "date": time.strftime("%Y-07-15"),
+            }
+        )
+        self.assertEqual(
+            len(
+                new_line.move_id.line_ids.filtered(
+                    lambda line: line.account_id == journal.default_account_id
+                )
+            ),
+            1,
+        )
+        self.assertFalse(new_line.is_reconciled)
+
     def test_reconcile_rule_tax(self):
         """
         We want to test what happens when we select an reconcile model to fill a

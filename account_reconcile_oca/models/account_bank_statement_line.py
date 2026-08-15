@@ -982,10 +982,12 @@ class AccountBankStatementLine(models.Model):
         self.flush_recordset()
         self.env["account.move"].flush_model()
         self.env["account.move.line"].flush_model()
+        self.env["account.journal"].flush_model()
         query = Query(self.env, self._table, self._table_sql)
         move = self.env["account.move"]
         move_line = self.env["account.move.line"]
         account = self.env["account.account"]
+        journal = self.env["account.journal"]
         query.add_join(
             "JOIN",
             move_line._table,
@@ -1020,6 +1022,33 @@ class AccountBankStatementLine(models.Model):
                 SQL.identifier(move._table, "id"),
                 SQL.identifier(move_line._table, "move_id"),
             ),
+        )
+        query.add_join(
+            "JOIN",
+            journal._table,
+            journal._table,
+            SQL(
+                "%s = %s",
+                SQL.identifier(journal._table, "id"),
+                SQL.identifier(self._table, "journal_id"),
+            ),
+        )
+        # Never propose the statement line's own liquidity account as a
+        # counterpart. _reconcile_bank_line_edit() writes the proposal as a new
+        # line on the statement move, so a counterpart on that account leaves
+        # the move with two bank/cash lines, which
+        # account.bank.statement.line._synchronize_from_moves rejects with
+        # "reached an invalid state regarding its related statement line".
+        # Bank accounts are normally reconcile=False and never reach this
+        # query, but liability_credit_card accounts default to reconcile=True,
+        # so card journals hit it as soon as two of their own unreconciled
+        # lines look like a match.
+        query.add_where(
+            SQL(
+                "%s IS DISTINCT FROM %s",
+                SQL.identifier(move_line._table, "account_id"),
+                SQL.identifier(journal._table, "default_account_id"),
+            )
         )
         query.add_where(
             SQL(
