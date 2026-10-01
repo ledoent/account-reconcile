@@ -1,0 +1,12 @@
+# DO NOT MERGE — temporary pins until the 20.0 ports of this module's dependency
+# chain land. PyPI has no 20.0 wheel for either (account_reconcile_oca tops out
+# at 19.0.1.0.11, account_statement_base at 19.0.1.0.1), so CI cannot resolve
+# them from the index. Both lines go when the PRs merge and the wheels ship.
+#
+# OCA/account-reconcile#1049 — account_reconcile_oca, this module's only depends.
+odoo-addon-account_reconcile_oca @ git+https://github.com/OCA/account-reconcile@refs/pull/1049/head#subdirectory=account_reconcile_oca
+# OCA/account-reconcile#1048 — account_statement_base, required transitively by
+# account_reconcile_oca. #1049 carries this same pin in its own
+# test-requirements.txt, but pip will not read a dependency's file, so it has to
+# be repeated here.
+odoo-addon-account_statement_base @ git+https://github.com/OCA/account-reconcile@refs/pull/1048/head#subdirectory=account_statement_base
