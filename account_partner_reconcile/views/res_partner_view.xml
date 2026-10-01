@@ -14,7 +14,7 @@
                     type="object"
                     name="action_open_reconcile"
                     context="{'reconcile_mode': 'customers'}"
-                    icon="fa-usd"
+                    icon="attach_money"
                     groups="account.group_account_invoice"
                     string="Match Receivables"
                 />
@@ -24,7 +24,7 @@
                     name="action_open_reconcile"
                     context="{'reconcile_mode': 'suppliers'}"
                     groups="account.group_account_invoice"
-                    icon="fa-usd"
+                    icon="attach_money"
                     string="Match Payables"
                 />
             </div>

@@ -3,7 +3,7 @@
 
 {
     "name": "Account Partner Reconcile",
-    "version": "19.0.1.0.0",
+    "version": "20.0.1.0.0",
     "category": "Accounting",
     "author": "ForgeFlow, Odoo Community Association (OCA)",
     "website": "https://github.com/OCA/account-reconcile",
