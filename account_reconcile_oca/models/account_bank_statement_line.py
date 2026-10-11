@@ -18,6 +18,10 @@ class AccountBankStatementLine(models.Model):
     _name = "account.bank.statement.line"
     _inherit = ("account.bank.statement.line", "account.reconcile.abstract")
 
+    # Shortest normalised reference accepted as an invoice match. Below this
+    # a reference matches too much to mean anything.
+    _reference_match_min_length = 6
+
     reconcile_data_info = fields.Json(
         inverse="_inverse_reconcile_data_info", compute="_compute_reconcile_data_info"
     )
@@ -1048,25 +1052,80 @@ class AccountBankStatementLine(models.Model):
         )
         query.add_where(
             SQL(
-                """((
-                %(move_ref)s IS NOT NULL AND %(move_ref)s
-                ILIKE '%%' || %(st_ref)s || '%%'
-            ) OR (
-                %(line_ref)s IS NOT NULL AND %(line_ref)s
-                ILIKE '%%' || %(st_ref)s || '%%'
-            ) OR (
-                %(move_name)s IS NOT NULL AND %(move_name)s
-                ILIKE '%%' || %(st_ref)s || '%%'
-            ))""",
-                move_ref=SQL.identifier(move._table, "payment_reference"),
-                st_ref=SQL.identifier(self._table, "payment_ref"),
-                line_ref=SQL.identifier(move_line._table, "ref"),
-                move_name=SQL.identifier(move._table, "name"),
+                "(%s OR %s OR %s OR %s)",
+                self._reference_match_sql(
+                    SQL.identifier(move._table, "payment_reference")
+                ),
+                self._reference_match_sql(SQL.identifier(move_line._table, "ref")),
+                self._reference_match_sql(SQL.identifier(move._table, "name")),
+                self._amount_match_sql(),
             )
         )
         query.groupby = SQL.identifier(self._table, "id")
-        query.having = SQL("COUNT(*) = 1")
+        # A single candidate is an unambiguous match. Several candidates are
+        # still unambiguous when they are interchangeable: same partner and
+        # same residual, as recurring invoices of a fixed amount are. Picking
+        # between those is a choice of which one to age, settled below by
+        # taking the oldest.
+        query.having = SQL(
+            "COUNT(*) = 1 OR COUNT(DISTINCT (%(partner)s, %(residual)s)) = 1",
+            partner=SQL.identifier(move_line._table, "partner_id"),
+            residual=SQL.identifier(move_line._table, "amount_residual"),
+        )
         return query
+
+    def _reference_match_sql(self, column):
+        """Match a reference column against the statement line label.
+
+        Both sides are normalised to lowercase alphanumerics first: a bank
+        feed quotes an invoice number with whatever punctuation it likes
+        ("Inv #2026/0002" for "INV/2026/0002"), so comparing the raw strings
+        finds nothing. Either string may contain the other, since the label
+        can be the longer text ("Check deposit ... | Inv #2026/0002") or the
+        shorter one ("2026/0002" against a reference carrying a prefix).
+
+        The length floor keeps a short or near-empty reference from matching
+        every statement line in the company.
+        """
+        normalized_column = self._normalize_reference_sql(column)
+        normalized_label = self._normalize_reference_sql(
+            SQL.identifier(self._table, "payment_ref")
+        )
+        return SQL(
+            """(%(column)s IS NOT NULL AND (
+                (LENGTH(%(normalized_column)s) >= %(min_length)s
+                    AND POSITION(%(normalized_column)s IN %(normalized_label)s) > 0)
+                OR (LENGTH(%(normalized_label)s) >= %(min_length)s
+                    AND POSITION(%(normalized_label)s IN %(normalized_column)s) > 0)
+            ))""",
+            column=column,
+            normalized_column=normalized_column,
+            normalized_label=normalized_label,
+            min_length=self._reference_match_min_length,
+        )
+
+    def _normalize_reference_sql(self, column):
+        return SQL("REGEXP_REPLACE(LOWER(%s), '[^a-z0-9]', '', 'g')", column)
+
+    def _amount_match_sql(self):
+        """Match a known counterparty's open item by exact amount.
+
+        Direction is already enforced by the join. A partner is required: an
+        amount on its own is a coincidence, and this runs unattended on
+        import. Foreign-currency lines are left out, their residual not being
+        comparable to the statement amount without a conversion.
+        """
+        return SQL(
+            """(%(st_partner)s IS NOT NULL
+                AND %(st_foreign_currency)s IS NULL
+                AND ABS(%(residual)s) = ABS(%(st_amount)s))""",
+            st_partner=SQL.identifier(self._table, "partner_id"),
+            st_foreign_currency=SQL.identifier(self._table, "foreign_currency_id"),
+            residual=SQL.identifier(
+                self.env["account.move.line"]._table, "amount_residual"
+            ),
+            st_amount=SQL.identifier(self._table, "amount"),
+        )
 
     def _do_auto_reconcile_invoices(self):
         if not self:
@@ -1074,7 +1133,12 @@ class AccountBankStatementLine(models.Model):
         query = self._do_auto_reconcile_invoices_query()
         query_st = query.select(
             SQL.identifier(self._table, "id"),
-            SQL("max(%s)", SQL.identifier(self.env["account.move.line"]._table, "id")),
+            # Oldest first, the order Odoo settles interchangeable open items in.
+            SQL(
+                "(ARRAY_AGG(%(aml_id)s ORDER BY %(move_date)s, %(aml_id)s))[1]",
+                aml_id=SQL.identifier(self.env["account.move.line"]._table, "id"),
+                move_date=SQL.identifier(self.env["account.move"]._table, "date"),
+            ),
         )
         self.env.cr.execute(query_st)
         done = self.browse()
